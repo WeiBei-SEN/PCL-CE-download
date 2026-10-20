@@ -1,0 +1,133 @@
+name: Follow PCL upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-pcl-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream PCL
+        uses: actions/checkout@v4
+        with:
+          repository: Meloong-Git/PCL
+          ref: main
+          submodules: recursive
+          fetch-depth: 0
+          path: upstream
+
+      - name: Apply custom setting and detect duplicate build
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $sourceFile = 'upstream/Plain Craft Launcher 2/Modules/ModSecret.vb'
+            if (-not (Test-Path -LiteralPath $sourceFile)) {
+              throw "Source file does not exist: $sourceFile"
+            }
+            $content = Get-Content -LiteralPath $sourceFile -Raw
+            $pattern = 'Public Const RestrictMcDownload As Boolean = (True|False)'
+            if (-not [regex]::IsMatch($content, $pattern)) {
+              throw "RestrictMcDownload declaration was not found in $sourceFile"
+            }
+            $content = [regex]::Replace($content, $pattern, 'Public Const RestrictMcDownload As Boolean = False')
+            Set-Content -LiteralPath $sourceFile -Value $content -Encoding utf8
+            if (-not (Select-String -LiteralPath $sourceFile -Pattern 'Public Const RestrictMcDownload As Boolean = False' -Quiet)) {
+              throw 'Custom download setting was not applied'
+            }
+            $commit = (git -C upstream rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Could not read the upstream commit hash' }
+            $tag = "upstream-$($commit.Substring(0, 12))"
+            "commit=$commit" >> $env:GITHUB_OUTPUT
+            "tag=$tag" >> $env:GITHUB_OUTPUT
+
+            $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+            $releaseUrl = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+            try {
+              Invoke-RestMethod -Uri $releaseUrl -Headers $headers -Method Get -ErrorAction Stop | Out-Null
+              "skip=true" >> $env:GITHUB_OUTPUT
+            } catch {
+              $statusCode = [int]$_.Exception.Response.StatusCode
+              if ($statusCode -eq 404) {
+                "skip=false" >> $env:GITHUB_OUTPUT
+              } else {
+                throw "GitHub Release lookup failed with HTTP $statusCode. Check repository permissions and workflow settings."
+              }
+            }
+          } catch {
+            Write-Error "Preparation failed: $($_.Exception.Message)"
+            exit 1
+          }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Stop if this upstream commit was already released
+        if: steps.source.outputs.skip == 'true'
+        run: echo "This upstream commit has already been published."
+
+      - name: Set up .NET SDK
+        if: steps.source.outputs.skip != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        if: steps.source.outputs.skip != 'true'
+        run: dotnet restore "upstream/PCLCS/PCLCS.csproj"
+
+      - name: Set up MSBuild
+        if: steps.source.outputs.skip != 'true'
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Build Release
+        if: steps.source.outputs.skip != 'true'
+        shell: pwsh
+        run: msbuild "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.vbproj" /p:Configuration=Release /p:Platform=AnyCPU
+
+      - name: Package build and source
+        if: steps.source.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projectDir = 'upstream/Plain Craft Launcher 2'
+          $exe = Get-ChildItem -Path "$projectDir/bin", "$projectDir/obj" -Filter 'Plain Craft Launcher 2.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $exe) {
+            $candidates = Get-ChildItem -Path $projectDir -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            throw "Build output was not found. EXE candidates: $($candidates -join '; ')"
+          }
+          $output = $exe.DirectoryName
+          Write-Host "Using build output directory: $output"
+          Compress-Archive -Path "$output/*" -DestinationPath PCL-windows.zip -Force
+          $sourceFiles = Get-ChildItem upstream -Force | Where-Object { $_.Name -ne '.git' }
+          Compress-Archive -Path $sourceFiles.FullName -DestinationPath PCL-source.zip -Force
+          Get-FileHash PCL-windows.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  PCL-windows.zip" } | Set-Content SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: steps.source.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          tag_name: ${{ steps.source.outputs.tag }}
+          name: PCL upstream ${{ steps.source.outputs.commit }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: false
+          body: |
+            Built from Meloong-Git/PCL commit `${{ steps.source.outputs.commit }}`.
+
+            Custom change: `RestrictMcDownload = False`.
+          files: |
+            PCL-windows.zip
+            PCL-source.zip
+            SHA256SUMS.txt
